@@ -43,6 +43,7 @@ pub struct DataTable {
     pub header: Option<Vec<String>>,
     /// Data rows (header excluded).
     pub rows: Vec<Vec<String>>,
+    source_indices: Option<Vec<usize>>,
 }
 
 impl DataTable {
@@ -162,13 +163,26 @@ impl DataTable {
             (None, all_records)
         };
 
-        Ok(DataTable { header, rows })
+        Ok(DataTable {
+            header,
+            rows,
+            source_indices: None,
+        })
     }
 
     /// Resolve a `ColSpec` to a 0-based column index.
     pub fn resolve(&self, col: &ColSpec) -> Result<usize, String> {
         match col {
-            ColSpec::Index(i) => Ok(*i),
+            ColSpec::Index(i) => {
+                if let Some(indices) = &self.source_indices {
+                    indices
+                        .iter()
+                        .position(|idx| idx == i)
+                        .ok_or_else(|| format!("Column index {i} not found in projected table"))
+                } else {
+                    Ok(*i)
+                }
+            }
             ColSpec::Name(name) => {
                 let header = self.header.as_ref().ok_or_else(|| {
                     format!(
@@ -244,6 +258,7 @@ impl DataTable {
                     DataTable {
                         header: self.header.clone(),
                         rows,
+                        source_indices: self.source_indices.clone(),
                     },
                 )
             })
@@ -344,7 +359,7 @@ where
         (col_indices, header)
     };
 
-    let mask = ProjectionMask::roots(&parquet_schema, col_indices);
+    let mask = ProjectionMask::roots(&parquet_schema, col_indices.clone());
 
     let batch_reader = builder
         .with_projection(mask)
@@ -352,14 +367,27 @@ where
         .build()
         .map_err(|e| format!("Cannot build parquet reader: {e}"))?;
 
+    let mut projected_indices = col_indices.clone();
+    projected_indices.sort_unstable();
+    projected_indices.dedup();
+    let projected_positions: Vec<usize> = col_indices
+        .iter()
+        .map(|idx| {
+            projected_indices
+                .iter()
+                .position(|projected_idx| projected_idx == idx)
+                .expect("projected_indices was built from col_indices")
+        })
+        .collect();
+
     let mut rows: Vec<Vec<String>> = Vec::new();
     for batch_result in batch_reader {
         let batch = batch_result.map_err(|e| format!("Failed to read parquet batch: {e}"))?;
         let n_rows = batch.num_rows();
-        let n_cols = batch.num_columns();
         // Convert each projected column to strings, then transpose into rows.
-        let col_strs: Vec<Vec<String>> = (0..n_cols)
-            .map(|ci| {
+        let col_strs: Vec<Vec<String>> = projected_positions
+            .iter()
+            .map(|&ci| {
                 let col = batch.column(ci);
                 (0..n_rows)
                     .map(|ri| arrow_value_to_string(col.as_ref(), ri))
@@ -374,6 +402,7 @@ where
     Ok(DataTable {
         header: Some(header),
         rows,
+        source_indices: Some(col_indices),
     })
 }
 
